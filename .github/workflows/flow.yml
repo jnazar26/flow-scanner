@@ -1,0 +1,64 @@
+name: Options flow scan
+
+# Every 5 minutes during US market hours, weekdays.
+# 13:30-20:00 UTC is 9:30am-4:00pm ET during daylight saving.
+# Unmetered because this repo is PUBLIC. Results are pushed to a separate
+# private repo so nothing about what is being watched is ever visible here.
+on:
+  schedule:
+    - cron: "*/5 13-20 * * 1-5"
+  workflow_dispatch:
+
+# At this cadence a delayed run can collide with the next one. Cancel the
+# older scan rather than queue it - a stale reading is worth less than a
+# fresh one, and a backlog would compound.
+concurrency:
+  group: flow-scan
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install requests
+
+      # Pull the previous results out of the PRIVATE repo so the worker can
+      # append to flow_contracts.csv and skip alerts it has already sent.
+      - name: Fetch prior results
+        env:
+          TOKEN: ${{ secrets.RESULTS_TOKEN }}
+          REPO: ${{ secrets.RESULTS_REPO }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${REPO}.git" _results
+          cp _results/flow_contracts.csv . 2>/dev/null || true
+          cp _results/flow_alerted.json  . 2>/dev/null || true
+
+      - name: Scan
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+        run: python flow_worker.py
+
+      # Push results to the private repo. Nothing is committed here.
+      - name: Publish to private repo
+        env:
+          REPO: ${{ secrets.RESULTS_REPO }}
+        run: |
+          cp flow_latest.json flow_contracts.csv flow_alerted.json _results/ 2>/dev/null || true
+          cd _results
+          git config user.name  "flow-scanner"
+          git config user.email "flow-scanner@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet && echo "no change" && exit 0
+          git commit -m "flow scan $(date -u +'%Y-%m-%d %H:%M')"
+          git pull --rebase --autostash
+          git push
+
