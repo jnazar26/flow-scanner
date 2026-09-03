@@ -134,7 +134,7 @@ def scan_ticker(ticker):
         return None
 
     today = datetime.now(timezone.utc).date()
-    clusters, ivs, gex_pool, all_oi = [], [], [], []
+    clusters, ivs, gex_pool, all_oi, siblings = [], [], [], [], []
     gex_call = gex_put = 0.0
 
     for r in results:
@@ -190,6 +190,13 @@ def scan_ticker(ticker):
             gex_pool.append({"strike": strike, "type": ctype, "expiry": expiry,
                              "oi": oi, "iv": iv})
         all_oi.append({"contract": det.get("ticker", ""), "oi": oi})
+        # Every traded contract, not just the ones clearing MIN_PREMIUM. A
+        # spread's other leg is often cheaper and would never rank into the
+        # tape-analysis set on its own.
+        if vol:
+            siblings.append({"contract": det.get("ticker", ""),
+                             "strike": strike, "type": ctype,
+                             "expiry": expiry, "volume": vol})
         if vol < MIN_VOL or not close:
             continue
         # Rank on EXTRINSIC value. Total premium favours deep-ITM contracts,
@@ -226,7 +233,7 @@ def scan_ticker(ticker):
 
     profile = gamma_profile(gex_pool, spot)
     return {"ticker": ticker, "spot": spot, "clusters": clusters,
-            "profile": profile, "all_oi": all_oi,
+            "profile": profile, "all_oi": all_oi, "siblings": siblings,
             "total_premium": total, "median_iv": statistics.median(ivs) if ivs else None,
             "gex": gex_call + gex_put,
             "call_premium": sum(c["premium"] for c in clusters if c["type"] == "call"),
@@ -817,5 +824,6 @@ def render(c, tk, tape, iv_rank, prem_rank):
         if lv:
             L.append("    Levels: " + " · ".join(lv))
     return "\n".join(L)
+
 
 
