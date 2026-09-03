@@ -159,7 +159,7 @@ def main():
         sibs.sort(key=lambda s: abs(s["strike"] - c["strike"]))
         mine = {(p["ts"], p["size"]) for p in tape["prints"]}
         for s_ in sibs[:2]:
-            other = classify_contract(s_["contract"], fc._SESSION)
+            other = fc.classify_contract(s_["contract"], fc._SESSION)
             if not other or not other.get("prints"):
                 continue
             hits = sum(1 for p in other["prints"] if (p["ts"], p["size"]) in mine)
