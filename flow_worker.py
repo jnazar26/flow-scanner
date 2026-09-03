@@ -157,12 +157,29 @@ def main():
             continue
         # nearest strike first: verticals are usually adjacent-ish
         sibs.sort(key=lambda s: abs(s["strike"] - c["strike"]))
-        mine = {(p["ts"], p["size"]) for p in tape["prints"]}
-        for s_ in sibs[:2]:
+        # Match on SIZE plus a small time WINDOW, not an identical timestamp.
+        # A legged spread is two separate orders: they fill milliseconds apart,
+        # never on the same nanosecond. Requiring exact timestamps only catches
+        # true multi-leg executions, which the condition codes already flag —
+        # so the earlier version was testing for the one thing that could not
+        # be there.
+        PAIR_WINDOW_NS = 2_000_000_000        # 2 seconds
+        mine = [(p["ts"], p["size"]) for p in tape["prints"]]
+        for s_ in sibs[:3]:
             other = fc.classify_contract(s_["contract"], fc._SESSION)
             if not other or not other.get("prints"):
                 continue
-            hits = sum(1 for p in other["prints"] if (p["ts"], p["size"]) in mine)
+            hits, used = 0, set()
+            for q in other["prints"]:
+                for i, (ts, sz) in enumerate(mine):
+                    if i in used:
+                        continue
+                    if q["size"] == sz and abs(q["ts"] - ts) <= PAIR_WINDOW_NS:
+                        used.add(i)
+                        hits += 1
+                        break
+            print(f"    checked {c['ticker']} {c['strike']:g} vs "
+                  f"{s_['strike']:g} — {hits} size+time matches", flush=True)
             if hits >= 2:
                 c["_paired"] = True
                 c["_partner"] = f"{s_['strike']:g}{s_['type'][0].upper()}"
