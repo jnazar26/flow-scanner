@@ -137,6 +137,40 @@ def main():
         c["_tape"] = fc.classify_contract(c["contract"], fc._SESSION)
     print(f"  classified {len(top)} contracts", flush=True)
 
+    # ---- legged spread detection -----------------------------------------
+    # A spread entered as two separate single-leg orders carries no multi-leg
+    # condition code, and the cheaper leg often never ranks into the tape set.
+    # Observed live: ORCL 165C (8,634 lots, $3.7M) tagged BULLISH while 175C
+    # traded 6,271 lots in the same expiry — the other half of a vertical.
+    # So: screen the whole chain for a sibling with comparable volume, then
+    # confirm against the tape before downgrading.
+    SIB_LO, SIB_HI = 0.45, 2.2          # plausible leg-size ratio
+    for c in top:
+        tape = c.get("_tape") or {}
+        if not tape.get("prints") or c.get("_paired"):
+            continue
+        sibs = [s for s in (c["_snap"].get("siblings") or [])
+                if s["expiry"] == c["expiry"] and s["type"] == c["type"]
+                and s["contract"] != c["contract"]
+                and SIB_LO <= (s["volume"] / max(c["volume"], 1)) <= SIB_HI]
+        if not sibs:
+            continue
+        # nearest strike first: verticals are usually adjacent-ish
+        sibs.sort(key=lambda s: abs(s["strike"] - c["strike"]))
+        mine = {(p["ts"], p["size"]) for p in tape["prints"]}
+        for s_ in sibs[:2]:
+            other = classify_contract(s_["contract"], fc._SESSION)
+            if not other or not other.get("prints"):
+                continue
+            hits = sum(1 for p in other["prints"] if (p["ts"], p["size"]) in mine)
+            if hits >= 2:
+                c["_paired"] = True
+                c["_partner"] = f"{s_['strike']:g}{s_['type'][0].upper()}"
+                c["_partner_hits"] = hits
+                print(f"    spread: {c['ticker']} {c['strike']:g} paired with "
+                      f"{c['_partner']} ({hits} matching prints)", flush=True)
+                break
+
     # cross-contract spread pairing (condition codes miss many of these)
     sig = defaultdict(list)
     for c in top:
@@ -162,6 +196,8 @@ def main():
             "volume": c["volume"], "open_interest": c["oi"],
             "concentration": round(c["concentration"], 3),
             "verdict": tier.upper(),
+            "partner": c.get("_partner"),
+            "partner_hits": c.get("_partner_hits"),
             "ask_share": tape.get("ask_share"),
             "mid_share": tape.get("mid_share"),
             "confidence": tape.get("confidence"),
