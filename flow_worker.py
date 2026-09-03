@@ -168,6 +168,16 @@ def main():
             "sweeps": tape.get("sweeps"), "legs": tape.get("legs"),
             "gex": (c["_snap"].get("profile") or {}).get("net_gex"),
             "flip": (c["_snap"].get("profile") or {}).get("flip"),
+            "call_wall": (c["_snap"].get("profile") or {}).get("call_wall"),
+            "put_wall": (c["_snap"].get("profile") or {}).get("put_wall"),
+            "vol_oi": c.get("vol_oi"),
+            # when it happened, and the prints behind the verdict
+            "first_ts": tape.get("first_ts"), "last_ts": tape.get("last_ts"),
+            "n_trades": tape.get("n_trades"),
+            "prints": [{"ts": p["ts"], "size": p["size"], "price": p["price"],
+                        "bid": p["bid"], "ask": p["ask"], "side": p["side"],
+                        "age_ms": round(p["age_ms"])}
+                       for p in (tape.get("prints") or [])[:6]],
         }
         out.append(rec)
 
@@ -217,3 +227,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
