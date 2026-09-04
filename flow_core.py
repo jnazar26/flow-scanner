@@ -35,15 +35,33 @@ MAX_TICKERS      = 500     # Tier 1 scan breadth (1 API call each)
 TOP_N_DEEP       = 30      # contracts sent to Tier 2 tape analysis
 MIN_PREMIUM      = 250_000 # ignore clusters below this
 MIN_VOL          = 100     # ignore contracts below this day volume
-DTE_MIN, DTE_MAX = 3, 180
-MONEYNESS        = 0.15    # +/-15% of spot (30% admitted stock-proxy strikes)
+# Two separate universes. 0-2 DTE is a different animal - overwhelmingly
+# intraday hedging that closes before the bell, so it can never "stick" in the
+# open-interest sense. It gets its own tier and its own ranking rather than
+# competing with multi-day positioning for the same slots, where SPY and QQQ
+# would win on premium every day.
+DTE_MIN, DTE_MAX = 3, 365
+ZERO_DTE_MIN, ZERO_DTE_MAX = 0, 2
+TOP_N_ZERO_DTE   = 12      # separate leaderboard for the 0-2 DTE tier
+# Only liquid names list 0-2 DTE contracts at all, so that sweep does not need
+# the full universe. Scanning the top 150 keeps the two-pass run inside the
+# 5-minute cron.
+ZERO_DTE_TICKERS = 150
+# Strike band. Widened from 15% so genuinely large prints on far strikes are
+# not invisible; MIN_PREMIUM and MIN_VOL do the real filtering, and the
+# extrinsic-share note on each card flags stock-proxy strikes rather than
+# hiding them.
+MONEYNESS        = 0.40    # +/-40% of spot
 MIN_DIRECTIONAL_PRINTS = 3     # prints needed before claiming a side...
 SINGLE_PRINT_PREMIUM = 500_000 # ...unless one print is this big
 SINGLE_PRINT_CONFIDENCE = 0.60 # ...and classified on a tight, fresh book
 TAPE_TOP_PRINTS  = 12      # largest prints classified per contract
 MIN_DIRECTIONAL_SHARE = 0.55  # premium at a touch required to claim a side
 MAX_QUOTE_AGE_MS = 5_000   # beyond this the quote is not a usable book
-MAX_PER_TICKER   = 2       # stop one name flooding the report
+# Several distinct flows on one name are several events, not one. They get
+# grouped under a single card in the app but keep separate premium and
+# separate verdicts.
+MAX_PER_TICKER   = 4
 
 # Condition codes (OPRA)
 COND_MULTILEG    = {227, 228, 229, 230, 231}
@@ -121,7 +139,7 @@ def get(path, params=None, retries=3):
 _SESSION = None
 
 
-def scan_ticker(ticker):
+def scan_ticker(ticker, dte_lo=None, dte_hi=None):
     """One call returns the full chain. Returns per-contract clusters + GEX."""
     j = get(f"/v3/snapshot/options/{ticker}", {"limit": 250})
     if not j:
@@ -155,7 +173,9 @@ def scan_ticker(ticker):
             continue
 
         dte = (expiry - today).days
-        if not (DTE_MIN <= dte <= DTE_MAX):
+        lo = DTE_MIN if dte_lo is None else dte_lo
+        hi = DTE_MAX if dte_hi is None else dte_hi
+        if not (lo <= dte <= hi):
             continue
         if abs(strike - spot) / spot > MONEYNESS:
             continue
