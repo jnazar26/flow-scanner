@@ -34,6 +34,22 @@ ALERT_TIERS = {"bullish", "bearish"}
 STATE = "flow_alerted.json"      # so a signal is not re-sent every 30 minutes
 
 
+def watchlist():
+    """Names you follow, read from the PRIVATE repo.
+
+    The workflow already clones the private repo for flow_contracts.csv, so
+    watchlist.txt rides along. Keeping it there rather than in this public
+    repo means the list of what you watch is never exposed.
+    """
+    for path in ("_results/watchlist.txt", "watchlist.txt"):
+        try:
+            return [l.strip().upper() for l in open(path)
+                    if l.strip() and not l.startswith("#")]
+        except FileNotFoundError:
+            continue
+    return []
+
+
 def universe(n):
     """Most liquid names from the last session, fetched at runtime.
 
@@ -57,7 +73,16 @@ def universe(n):
                        if a.get("T") and a.get("c") and a.get("v")
                        and a["c"] >= 5]
                 liq.sort(key=lambda x: -x[1])
-                return [t for t, _ in liq[:n]]
+                ranked = [t for t, _ in liq]
+                wl = watchlist()
+                if wl:
+                    tradeable = set(ranked)
+                    forced = [t for t in wl if t in tradeable]
+                    rest = [t for t in ranked if t not in set(forced)]
+                    print(f"  watchlist: {len(forced)}/{len(wl)} included",
+                          flush=True)
+                    return forced + rest[:max(n - len(forced), 0)]
+                return ranked[:n]
         d -= timedelta(days=1)
         while d.weekday() >= 5:
             d -= timedelta(days=1)
@@ -105,14 +130,19 @@ def main():
         sys.exit("could not build a universe from the grouped endpoint")
     print(f"session {fc._SESSION} · scanning {len(tickers)} tickers", flush=True)
 
+    import time as _t
+    t0 = _t.time()
     snaps = []
-    for t in tickers:
+    for i, t in enumerate(tickers, 1):
         s = fc.scan_ticker(t)
         if s:
             snaps.append(s)
+        if i % 100 == 0:
+            print(f"    {i}/{len(tickers)} scanned · {len(snaps)} active · "
+                  f"{_t.time()-t0:.0f}s", flush=True)
     if not snaps:
         print("no chain activity"); return
-    print(f"  {len(snaps)} with activity", flush=True)
+    print(f"  {len(snaps)} with activity ({_t.time()-t0:.0f}s)", flush=True)
 
     all_c = []
     for s in snaps:
@@ -275,7 +305,12 @@ def main():
     else:
         print("  nothing cleared the alert bar", flush=True)
 
-    print(f"done · {len(out)} clusters logged", flush=True)
+    el = _t.time() - t0
+    print(f"done · {len(out)} clusters logged · {el:.0f}s total", flush=True)
+    if el > 240:
+        print("  NOTE: approaching the 5-minute cron interval. Lower "
+              "TOP_N_DEEP or MAX_TICKERS in flow_core.py if runs start "
+              "overlapping.", flush=True)
 
 
 if __name__ == "__main__":
