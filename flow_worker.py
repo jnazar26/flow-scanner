@@ -132,168 +132,79 @@ def main():
 
     import time as _t
     t0 = _t.time()
-    snaps = []
-    for i, t in enumerate(tickers, 1):
-        s = fc.scan_ticker(t)
-        if s:
-            snaps.append(s)
-        if i % 100 == 0:
-            print(f"    {i}/{len(tickers)} scanned · {len(snaps)} active · "
-                  f"{_t.time()-t0:.0f}s", flush=True)
-    if not snaps:
-        print("no chain activity"); return
-    print(f"  {len(snaps)} with activity ({_t.time()-t0:.0f}s)", flush=True)
 
-    all_c = []
-    for s in snaps:
-        for c in s["clusters"]:
-            c["_snap"] = s
-            c["_score"] = (0.40 * min(c["premium"] / 15e6, 1.0)
-                           + 0.25 * min(c["concentration"] / 0.5, 1.0)
-                           + 0.20 * c["newness"]
-                           + 0.15 * min(c["delta_notional"] / 50e6, 1.0))
-            all_c.append(c)
-    all_c.sort(key=lambda c: -c["_score"])
-    seen, top = defaultdict(int), []
-    for c in all_c:
-        if seen[c["ticker"]] >= fc.MAX_PER_TICKER:
-            continue
-        seen[c["ticker"]] += 1
-        top.append(c)
-        if len(top) >= fc.TOP_N_DEEP:
-            break
-
-    for c in top:
-        c["_tape"] = fc.classify_contract(c["contract"], fc._SESSION)
-    print(f"  classified {len(top)} contracts", flush=True)
-
-    # ---- legged spread detection -----------------------------------------
-    # A spread entered as two separate single-leg orders carries no multi-leg
-    # condition code, and the cheaper leg often never ranks into the tape set.
-    # Observed live: ORCL 165C (8,634 lots, $3.7M) tagged BULLISH while 175C
-    # traded 6,271 lots in the same expiry — the other half of a vertical.
-    # So: screen the whole chain for a sibling with comparable volume, then
-    # confirm against the tape before downgrading.
-    SIB_LO, SIB_HI = 0.45, 2.2          # plausible leg-size ratio
-    for c in top:
-        tape = c.get("_tape") or {}
-        if not tape.get("prints") or c.get("_paired"):
-            continue
-        sibs = [s for s in (c["_snap"].get("siblings") or [])
-                if s["expiry"] == c["expiry"] and s["type"] == c["type"]
-                and s["contract"] != c["contract"]
-                and SIB_LO <= (s["volume"] / max(c["volume"], 1)) <= SIB_HI]
-        if not sibs:
-            continue
-        # nearest strike first: verticals are usually adjacent-ish
-        sibs.sort(key=lambda s: abs(s["strike"] - c["strike"]))
-        # Match on SIZE plus a small time WINDOW, not an identical timestamp.
-        # A legged spread is two separate orders: they fill milliseconds apart,
-        # never on the same nanosecond. Requiring exact timestamps only catches
-        # true multi-leg executions, which the condition codes already flag —
-        # so the earlier version was testing for the one thing that could not
-        # be there.
-        PAIR_WINDOW_NS = 2_000_000_000        # 2 seconds
-        mine = [(p["ts"], p["size"]) for p in tape["prints"]]
-        for s_ in sibs[:3]:
-            other = fc.classify_contract(s_["contract"], fc._SESSION)
-            if not other or not other.get("prints"):
+    def sweep(lo, hi, top_n, label, universe=None):
+        """One pass over the universe for a given DTE band."""
+        uni = universe if universe is not None else tickers
+        snaps = []
+        for i, t in enumerate(uni, 1):
+            sn = fc.scan_ticker(t, lo, hi)
+            if sn:
+                snaps.append(sn)
+            if i % 100 == 0:
+                print(f"    [{label}] {i}/{len(uni)} · {len(snaps)} active "
+                      f"· {_t.time()-t0:.0f}s", flush=True)
+        if not snaps:
+            return [], []
+        allc = []
+        for sn in snaps:
+            for c in sn["clusters"]:
+                c["_snap"] = sn
+                c["_tier"] = label
+                c["_score"] = (0.40 * min(c["premium"] / 15e6, 1.0)
+                               + 0.25 * min(c["concentration"] / 0.5, 1.0)
+                               + 0.20 * c["newness"]
+                               + 0.15 * min(c["delta_notional"] / 50e6, 1.0))
+                allc.append(c)
+        allc.sort(key=lambda c: -c["_score"])
+        seen, picked = defaultdict(int), []
+        for c in allc:
+            if seen[c["ticker"]] >= fc.MAX_PER_TICKER:
                 continue
-            hits, used = 0, set()
-            for q in other["prints"]:
-                for i, (ts, sz) in enumerate(mine):
-                    if i in used:
-                        continue
-                    if q["size"] == sz and abs(q["ts"] - ts) <= PAIR_WINDOW_NS:
-                        used.add(i)
-                        hits += 1
-                        break
-            print(f"    checked {c['ticker']} {c['strike']:g} vs "
-                  f"{s_['strike']:g} — {hits} size+time matches", flush=True)
-            if hits >= 2:
-                c["_paired"] = True
-                c["_partner"] = f"{s_['strike']:g}{s_['type'][0].upper()}"
-                c["_partner_hits"] = hits
-                print(f"    spread: {c['ticker']} {c['strike']:g} paired with "
-                      f"{c['_partner']} ({hits} matching prints)", flush=True)
+            seen[c["ticker"]] += 1
+            picked.append(c)
+            if len(picked) >= top_n:
                 break
+        print(f"  [{label}] {len(snaps)} tickers active, "
+              f"{len(picked)} contracts selected ({_t.time()-t0:.0f}s)",
+              flush=True)
+        return picked, snaps
 
-    # cross-contract spread pairing (condition codes miss many of these)
-    sig = defaultdict(list)
-    for c in top:
-        for pr in (c.get("_tape") or {}).get("prints", []):
-            sig[(c["ticker"], pr["ts"], pr["size"])].append(c)
-    for group in sig.values():
-        if len({id(x) for x in group}) > 1:
-            for c in group:
-                c["_paired"] = True
+    top, snaps = sweep(fc.DTE_MIN, fc.DTE_MAX, fc.TOP_N_DEEP, "3-365d")
+    zero, zsnaps = sweep(fc.ZERO_DTE_MIN, fc.ZERO_DTE_MAX,
+                         fc.TOP_N_ZERO_DTE, "0-2d",
+                         universe=tickers[:fc.ZERO_DTE_TICKERS])
+    if not top and not zero:
+        print("no chain activity"); return
+    snaps = snaps + zsnaps
 
-    out, alerts = [], []
-    sent = already_sent()
-    new_keys = set()
-    for c in top:
-        tier = ("spread" if c.get("_paired")
-                else fc.classify_tier(c, c.get("_tape"))[0])
-        tape = c.get("_tape") or {}
-        rec = {
-            "ticker": c["ticker"], "contract": c["contract"],
-            "strike": c["strike"], "type": c["type"],
-            "expiry": c["expiry"].isoformat(), "dte": c["dte"],
-            "spot": round(c["spot"], 2), "premium": round(c["premium"]),
-            "volume": c["volume"], "open_interest": c["oi"],
-            "concentration": round(c["concentration"], 3),
-            "verdict": tier.upper(),
-            "partner": c.get("_partner"),
-            "partner_hits": c.get("_partner_hits"),
-            "ask_share": tape.get("ask_share"),
-            "mid_share": tape.get("mid_share"),
-            "confidence": tape.get("confidence"),
-            "sweeps": tape.get("sweeps"), "legs": tape.get("legs"),
-            "gex": (c["_snap"].get("profile") or {}).get("net_gex"),
-            "flip": (c["_snap"].get("profile") or {}).get("flip"),
-            "call_wall": (c["_snap"].get("profile") or {}).get("call_wall"),
-            "put_wall": (c["_snap"].get("profile") or {}).get("put_wall"),
-            "vol_oi": c.get("vol_oi"),
-            # when it happened, and the prints behind the verdict
-            "first_ts": tape.get("first_ts"), "last_ts": tape.get("last_ts"),
-            "n_trades": tape.get("n_trades"),
-            "prints": [{"ts": p["ts"], "size": p["size"], "price": p["price"],
-                        "bid": p["bid"], "ask": p["ask"], "side": p["side"],
-                        "age_ms": round(p["age_ms"])}
-                       for p in (tape.get("prints") or [])[:6]],
-        }
-        out.append(rec)
-
-        key = f"{c['contract']}|{tier}"
-        if (tier in ALERT_TIERS
-                and c["premium"] >= ALERT_MIN_PREMIUM
-                and (tape.get("confidence") or 0) >= ALERT_MIN_CONFIDENCE
-                and key not in sent):
-            a = tape.get("ask_share") or 0
-            side = "bought" if tier == "bullish" else "sold"
-            alerts.append(
-                f"**{c['ticker']} {c['strike']:g}"
-                f"{c['type'][0].upper()} {c['expiry']:%m/%d}** · "
-                f"${c['premium']/1e6:.1f}M {side}\n"
-                f"{max(a,1-a):.0%} of directional premium · "
-                f"conf {tape['confidence']:.2f} · "
-                f"{tape.get('sweeps',0)} sweeps · "
-                f"{c['concentration']:.0%} of day premium\n"
-                f"spot {c['spot']:,.2f} · vol/OI "
-                f"{(c['vol_oi'] or 0):.1f}x")
-            new_keys.add(key)
+    for c in top + zero:
+        c["_tape"] = fc.classify_contract(c["contract"], fc._SESSION)
+    print(f"  classified {len(top) + len(zero)} contracts "
+          f"({_t.time()-t0:.0f}s)", flush=True)
 
     json.dump({"session": str(fc._SESSION),
                "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "scanned": len(tickers), "active": len(snaps),
                "clusters": out}, open("flow_latest.json", "w"), indent=1)
 
+    # Log enough that the stick check can show what the original alert said,
+    # not just a bare OI delta.
+    fc.CONTRACT_FIELDS = ["date", "ticker", "contract", "strike", "type",
+                          "expiry", "volume", "open_interest", "premium",
+                          "verdict", "band", "spot", "concentration",
+                          "ask_share", "confidence", "sweeps", "first_ts",
+                          "dte"]
     fc.log_contracts([{
         "date": str(fc._SESSION), "ticker": r["ticker"],
         "contract": r["contract"], "strike": r["strike"], "type": r["type"],
         "expiry": r["expiry"], "volume": r["volume"],
         "open_interest": r["open_interest"], "premium": r["premium"],
-        "verdict": r["verdict"]} for r in out])
+        "verdict": r["verdict"], "band": r.get("band"), "spot": r.get("spot"),
+        "concentration": r.get("concentration"),
+        "ask_share": r.get("ask_share"), "confidence": r.get("confidence"),
+        "sweeps": r.get("sweeps"), "first_ts": r.get("first_ts"),
+        "dte": r.get("dte")} for r in out])
 
     if alerts:
         head = f"Options flow · {fc._SESSION} · {len(alerts)} readable"
