@@ -25,8 +25,14 @@ BASE = "https://api.massive.com"
 # Leave empty to scan the most liquid names automatically from bar_cache.csv.
 WATCHLIST = []
 
-MAX_TICKERS      = 120     # Tier 1 scan breadth (1 API call each)
-TOP_N_DEEP       = 25      # contracts sent to Tier 2 tape analysis
+# Tier 1 is one API call per ticker and runs about 6.5 tickers/second, so 500
+# costs ~75s. That matches the universe the pattern backtest was measured on,
+# rather than scanning a narrower slice than the strategy itself covers.
+MAX_TICKERS      = 500     # Tier 1 scan breadth (1 API call each)
+# Tier 2 costs ~13 calls per contract, so each increment is real time. A wider
+# Tier 1 mostly improves WHICH contracts reach this stage rather than needing
+# more of them.
+TOP_N_DEEP       = 30      # contracts sent to Tier 2 tape analysis
 MIN_PREMIUM      = 250_000 # ignore clusters below this
 MIN_VOL          = 100     # ignore contracts below this day volume
 DTE_MIN, DTE_MAX = 3, 180
