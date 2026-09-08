@@ -31,6 +31,11 @@ ALERT_MIN_PREMIUM = 2_000_000
 ALERT_MIN_CONFIDENCE = 0.55
 ALERT_TIERS = {"bullish", "bearish"}
 
+# Concurrency. Kept modest so the API is not hammered; these are read-only
+# GETs and the bottleneck is round-trip latency, not throughput.
+SCAN_WORKERS = 8
+TAPE_WORKERS = 5
+
 STATE = "flow_alerted.json"      # so a signal is not re-sent every 30 minutes
 
 
@@ -134,16 +139,30 @@ def main():
     t0 = _t.time()
 
     def sweep(lo, hi, top_n, label, universe=None):
-        """One pass over the universe for a given DTE band."""
+        """One pass over the universe for a given DTE band.
+
+        Chain fetches run concurrently. Each call is independent and spends
+        almost all its time waiting on the network, so a modest pool turns
+        serial latency into parallel waiting. Observed: the same 500-ticker
+        sweep took 93s one run and 182s the next purely on API speed, which
+        pushed the job past the 5-minute cron.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         uni = universe if universe is not None else tickers
-        snaps = []
-        for i, t in enumerate(uni, 1):
-            sn = fc.scan_ticker(t, lo, hi)
-            if sn:
-                snaps.append(sn)
-            if i % 100 == 0:
-                print(f"    [{label}] {i}/{len(uni)} · {len(snaps)} active "
-                      f"· {_t.time()-t0:.0f}s", flush=True)
+        snaps, done = [], 0
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            futs = {pool.submit(fc.scan_ticker, t, lo, hi): t for t in uni}
+            for f in as_completed(futs):
+                done += 1
+                try:
+                    sn = f.result()
+                except Exception:
+                    sn = None
+                if sn:
+                    snaps.append(sn)
+                if done % 100 == 0:
+                    print(f"    [{label}] {done}/{len(uni)} · {len(snaps)} "
+                          f"active · {_t.time()-t0:.0f}s", flush=True)
         if not snaps:
             return [], []
         allc = []
@@ -178,8 +197,16 @@ def main():
         print("no chain activity"); return
     snaps = snaps + zsnaps
 
-    for c in top + zero:
-        c["_tape"] = fc.classify_contract(c["contract"], fc._SESSION)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=TAPE_WORKERS) as pool:
+        futs = {c["contract"]: pool.submit(fc.classify_contract,
+                                           c["contract"], fc._SESSION)
+                for c in top + zero}
+        for c in top + zero:
+            try:
+                c["_tape"] = futs[c["contract"]].result()
+            except Exception:
+                c["_tape"] = None
     print(f"  classified {len(top) + len(zero)} contracts "
           f"({_t.time()-t0:.0f}s)", flush=True)
 
