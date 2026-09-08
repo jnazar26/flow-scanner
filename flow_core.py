@@ -177,6 +177,19 @@ def scan_ticker(ticker, dte_lo=None, dte_hi=None):
         hi = DTE_MAX if dte_hi is None else dte_hi
         if not (lo <= dte <= hi):
             continue
+        # Sibling capture happens BEFORE the moneyness gate on purpose. A
+        # spread's other leg can be anywhere in the chain: DYN traded 20,055
+        # of the 25C against 20,044 of the 35C with spot at 20.32, and the 35
+        # strike is 72% out — far outside the band that governs ranking. The
+        # day-staleness check still applies, so dormant strikes are excluded.
+        _du = (day or {}).get("last_updated")
+        if _du and et(_du).date() == _SESSION:
+            _v = (day or {}).get("volume") or 0
+            if _v:
+                siblings.append({"contract": det.get("ticker", ""),
+                                 "strike": strike, "type": ctype,
+                                 "expiry": expiry, "volume": _v})
+
         if abs(strike - spot) / spot > MONEYNESS:
             continue
 
@@ -216,13 +229,6 @@ def scan_ticker(ticker, dte_lo=None, dte_hi=None):
             gex_pool.append({"strike": strike, "type": ctype, "expiry": expiry,
                              "oi": oi, "iv": iv})
         all_oi.append({"contract": det.get("ticker", ""), "oi": oi})
-        # Every traded contract, not just the ones clearing MIN_PREMIUM. A
-        # spread's other leg is often cheaper and would never rank into the
-        # tape-analysis set on its own.
-        if vol:
-            siblings.append({"contract": det.get("ticker", ""),
-                             "strike": strike, "type": ctype,
-                             "expiry": expiry, "volume": vol})
         if vol < MIN_VOL or not close:
             continue
         # Rank on EXTRINSIC value. Total premium favours deep-ITM contracts,
