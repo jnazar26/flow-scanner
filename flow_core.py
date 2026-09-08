@@ -32,7 +32,7 @@ MAX_TICKERS      = 500     # Tier 1 scan breadth (1 API call each)
 # Tier 2 costs ~13 calls per contract, so each increment is real time. A wider
 # Tier 1 mostly improves WHICH contracts reach this stage rather than needing
 # more of them.
-TOP_N_DEEP       = 30      # contracts sent to Tier 2 tape analysis
+TOP_N_DEEP       = 24      # contracts sent to Tier 2 tape analysis
 MIN_PREMIUM      = 250_000 # ignore clusters below this
 MIN_VOL          = 100     # ignore contracts below this day volume
 # Two separate universes. 0-2 DTE is a different animal - overwhelmingly
@@ -42,11 +42,11 @@ MIN_VOL          = 100     # ignore contracts below this day volume
 # would win on premium every day.
 DTE_MIN, DTE_MAX = 3, 365
 ZERO_DTE_MIN, ZERO_DTE_MAX = 0, 2
-TOP_N_ZERO_DTE   = 12      # separate leaderboard for the 0-2 DTE tier
+TOP_N_ZERO_DTE   = 10      # separate leaderboard for the 0-2 DTE tier
 # Only liquid names list 0-2 DTE contracts at all, so that sweep does not need
 # the full universe. Scanning the top 150 keeps the two-pass run inside the
 # 5-minute cron.
-ZERO_DTE_TICKERS = 150
+ZERO_DTE_TICKERS = 120
 # Strike band. Widened from 15% so genuinely large prints on far strikes are
 # not invisible; MIN_PREMIUM and MIN_VOL do the real filtering, and the
 # extrinsic-share note on each card flags stock-proxy strikes rather than
