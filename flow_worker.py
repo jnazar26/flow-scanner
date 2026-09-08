@@ -183,6 +183,111 @@ def main():
     print(f"  classified {len(top) + len(zero)} contracts "
           f"({_t.time()-t0:.0f}s)", flush=True)
 
+    # ---- legged spread detection -----------------------------------------
+    # A spread entered as two separate single-leg orders carries no multi-leg
+    # condition code, and the cheaper leg often never ranks into the tape set.
+    # Observed live: ORCL 165C (8,634 lots, $3.7M) tagged BULLISH while 175C
+    # traded 6,271 lots in the same expiry — the other half of a vertical.
+    SIB_LO, SIB_HI = 0.45, 2.2          # plausible leg-size ratio
+    PAIR_WINDOW_NS = 2_000_000_000      # legs fill ms apart, not on the same ns
+    for c in top + zero:
+        tape = c.get("_tape") or {}
+        if not tape.get("prints") or c.get("_paired"):
+            continue
+        sibs = [q for q in (c["_snap"].get("siblings") or [])
+                if q["expiry"] == c["expiry"] and q["type"] == c["type"]
+                and q["contract"] != c["contract"]
+                and SIB_LO <= (q["volume"] / max(c["volume"], 1)) <= SIB_HI]
+        if not sibs:
+            continue
+        sibs.sort(key=lambda q: abs(q["strike"] - c["strike"]))
+        mine = [(p["ts"], p["size"]) for p in tape["prints"]]
+        for s_ in sibs[:3]:
+            other = fc.classify_contract(s_["contract"], fc._SESSION)
+            if not other or not other.get("prints"):
+                continue
+            hits, used = 0, set()
+            for q in other["prints"]:
+                for i, (ts, sz) in enumerate(mine):
+                    if i in used:
+                        continue
+                    if q["size"] == sz and abs(q["ts"] - ts) <= PAIR_WINDOW_NS:
+                        used.add(i); hits += 1; break
+            print(f"    checked {c['ticker']} {c['strike']:g} vs "
+                  f"{s_['strike']:g} — {hits} size+time matches", flush=True)
+            if hits >= 2:
+                c["_paired"] = True
+                c["_partner"] = f"{s_['strike']:g}{s_['type'][0].upper()}"
+                c["_partner_hits"] = hits
+                print(f"    spread: {c['ticker']} {c['strike']:g} paired with "
+                      f"{c['_partner']} ({hits} matching prints)", flush=True)
+                break
+
+    # identical size at an identical timestamp across two strikes is one order
+    sig = defaultdict(list)
+    for c in top + zero:
+        for pr in (c.get("_tape") or {}).get("prints", []):
+            sig[(c["ticker"], pr["ts"], pr["size"])].append(c)
+    for group in sig.values():
+        if len({id(x) for x in group}) > 1:
+            for c in group:
+                c["_paired"] = True
+
+    # ---- build the records ------------------------------------------------
+    out, alerts = [], []
+    sent = already_sent()
+    new_keys = set()
+    for c in top + zero:
+        tier = ("spread" if c.get("_paired")
+                else fc.classify_tier(c, c.get("_tape"))[0])
+        tape = c.get("_tape") or {}
+        rec = {
+            "ticker": c["ticker"], "contract": c["contract"],
+            "strike": c["strike"], "type": c["type"],
+            "expiry": c["expiry"].isoformat(), "dte": c["dte"],
+            "spot": round(c["spot"], 2), "premium": round(c["premium"]),
+            "volume": c["volume"], "open_interest": c["oi"],
+            "concentration": round(c["concentration"], 3),
+            "verdict": tier.upper(),
+            "band": c.get("_tier", "3-365d"),
+            "partner": c.get("_partner"),
+            "partner_hits": c.get("_partner_hits"),
+            "ask_share": tape.get("ask_share"),
+            "mid_share": tape.get("mid_share"),
+            "confidence": tape.get("confidence"),
+            "sweeps": tape.get("sweeps"), "legs": tape.get("legs"),
+            "gex": (c["_snap"].get("profile") or {}).get("net_gex"),
+            "flip": (c["_snap"].get("profile") or {}).get("flip"),
+            "call_wall": (c["_snap"].get("profile") or {}).get("call_wall"),
+            "put_wall": (c["_snap"].get("profile") or {}).get("put_wall"),
+            "vol_oi": c.get("vol_oi"),
+            "first_ts": tape.get("first_ts"), "last_ts": tape.get("last_ts"),
+            "n_trades": tape.get("n_trades"),
+            "prints": [{"ts": p["ts"], "size": p["size"], "price": p["price"],
+                        "bid": p["bid"], "ask": p["ask"], "side": p["side"],
+                        "age_ms": round(p["age_ms"])}
+                       for p in (tape.get("prints") or [])[:6]],
+        }
+        out.append(rec)
+
+        key = f"{c['contract']}|{tier}"
+        if (tier in ALERT_TIERS
+                and c["premium"] >= ALERT_MIN_PREMIUM
+                and (tape.get("confidence") or 0) >= ALERT_MIN_CONFIDENCE
+                and key not in sent):
+            a = tape.get("ask_share") or 0
+            side = "bought" if tier == "bullish" else "sold"
+            alerts.append(
+                f"**{c['ticker']} {c['strike']:g}"
+                f"{c['type'][0].upper()} {c['expiry']:%m/%d}** · "
+                f"${c['premium']/1e6:.1f}M {side}\n"
+                f"{max(a, 1-a):.0%} of directional premium · "
+                f"conf {tape['confidence']:.2f} · "
+                f"{tape.get('sweeps', 0)} sweeps · "
+                f"{c['concentration']:.0%} of day premium\n"
+                f"spot {c['spot']:,.2f} · {c['dte']}d to expiry")
+            new_keys.add(key)
+
     json.dump({"session": str(fc._SESSION),
                "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "scanned": len(tickers), "active": len(snaps),
