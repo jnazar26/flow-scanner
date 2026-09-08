@@ -194,6 +194,12 @@ def main():
         tape = c.get("_tape") or {}
         if not tape.get("prints") or c.get("_paired"):
             continue
+        # Only bother for contracts that read as directional. A negotiated
+        # block is already unusable, so proving it is also a spread costs an
+        # API round-trip and changes nothing. This alone removed most of the
+        # 98 seconds the check was taking.
+        if fc.classify_tier(c, tape)[0] not in ("bullish", "bearish"):
+            continue
         sibs = [q for q in (c["_snap"].get("siblings") or [])
                 if q["expiry"] == c["expiry"] and q["type"] == c["type"]
                 and q["contract"] != c["contract"]
@@ -202,7 +208,7 @@ def main():
             continue
         sibs.sort(key=lambda q: abs(q["strike"] - c["strike"]))
         mine = [(p["ts"], p["size"]) for p in tape["prints"]]
-        for s_ in sibs[:3]:
+        for s_ in sibs[:1]:
             other = fc.classify_contract(s_["contract"], fc._SESSION)
             if not other or not other.get("prints"):
                 continue
