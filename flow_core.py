@@ -333,8 +333,22 @@ def gamma_profile(contracts, spot, span=0.04, steps=41):
         v = bs_gamma(spot, c["strike"], T, c["iv"]) * c["oi"] * 100 * spot * spot * 0.01
         per_strike[c["strike"]] += v if c["type"] == "call" else -v
 
-    calls = {k: v for k, v in per_strike.items() if v > 0}
-    puts = {k: v for k, v in per_strike.items() if v < 0}
+    # A wall has to be big relative to the CHAIN, not merely the largest of
+    # several trivial numbers on its own side. SEI reported a put wall at 50
+    # where the strike held real size (2,357 contracts) but only $0.08M of
+    # gamma against $2M on the chain — 4%, and 26% below spot where gamma is
+    # negligible anyway. Reporting nothing is the honest answer there.
+    WALL_MIN_SHARE = 0.15   # of the largest absolute per-strike gamma
+    WALL_BAND = 0.15        # beyond this, dealer hedging barely responds
+    if not per_strike:
+        biggest = 0.0
+    else:
+        biggest = max(abs(v) for v in per_strike.values())
+    cut = biggest * WALL_MIN_SHARE
+    near = {k: v for k, v in per_strike.items()
+            if abs(k - spot) / spot <= WALL_BAND and abs(v) >= cut}
+    calls = {k: v for k, v in near.items() if v > 0}
+    puts = {k: v for k, v in near.items() if v < 0}
     net_now = next((g for s, g in curve if s >= spot), curve[-1][1])
 
     return {
