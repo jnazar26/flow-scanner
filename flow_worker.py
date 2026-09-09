@@ -296,6 +296,10 @@ def main():
             "vol_oi": c.get("vol_oi"),
             "first_ts": tape.get("first_ts"), "last_ts": tape.get("last_ts"),
             "n_trades": tape.get("n_trades"),
+            "n_classified": tape.get("n_classified"),
+            "unusable": tape.get("unusable"),
+            "classified_size": sum(p["size"]
+                                   for p in (tape.get("prints") or [])),
             "prints": [{"ts": p["ts"], "size": p["size"], "price": p["price"],
                         "bid": p["bid"], "ask": p["ask"], "side": p["side"],
                         "age_ms": round(p["age_ms"])}
