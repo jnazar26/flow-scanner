@@ -1,12 +1,22 @@
 name: Options flow scan
 
-# Every 5 minutes during US market hours, weekdays.
-# 13:30-20:00 UTC is 9:30am-4:00pm ET during daylight saving.
+# Every 10 minutes during US market hours, weekdays.
+#
+# 13-20 UTC covers 9am-4pm ET during daylight saving; 14-21 covers it during
+# standard time, so both are listed and the overlap simply runs a few extra
+# scans in the pre/post-market hour. Cheap, and it means nothing has to be
+# changed twice a year.
+#
+# Deliberately 10 minutes rather than 5. GitHub's scheduler is best-effort and
+# drops high-frequency jobs first under load — a */5 cron went 16 hours
+# without firing. Runs take ~71s, so 10 minutes still leaves ample headroom
+# and is far more likely to actually execute.
+#
 # Unmetered because this repo is PUBLIC. Results are pushed to a separate
 # private repo so nothing about what is being watched is ever visible here.
 on:
   schedule:
-    - cron: "*/5 13-20 * * 1-5"
+    - cron: "*/10 13-21 * * 1-5"
   workflow_dispatch:
 
 # At this cadence a delayed run can collide with the next one. Cancel the
@@ -61,4 +71,3 @@ jobs:
           git commit -m "flow scan $(date -u +'%Y-%m-%d %H:%M')"
           git pull --rebase --autostash
           git push
-
