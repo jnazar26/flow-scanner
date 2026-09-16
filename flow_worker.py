@@ -25,11 +25,21 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flow_core as fc
 
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:
+    _ET = timezone(timedelta(hours=-4))
+
 # Alert only on flow that cleared the reading bar. A NEGOTIATED block or a
 # spread leg is information for the log, not a reason to buzz a phone.
 ALERT_MIN_PREMIUM = 2_000_000
 ALERT_MIN_CONFIDENCE = 0.55
 ALERT_TIERS = {"bullish", "bearish"}
+# A single print of this size is worth naming regardless of how the contract's
+# daily aggregate ranks. This is the gap between "13,001 contracts traded" and
+# "someone bought 4,000 in one order" — the aggregate cannot distinguish them.
+BLOCK_ALERT_PREMIUM = 750_000
 
 # Concurrency. Kept modest so the API is not hammered; these are read-only
 # GETs and the bottleneck is round-trip latency, not throughput.
@@ -177,7 +187,31 @@ def main():
                 allc.append(c)
         allc.sort(key=lambda c: -c["_score"])
         seen, picked = defaultdict(int), []
+        chosen = set()
+
+        # Reserve slots for watchlist names FIRST. They are competing against
+        # mega-caps on absolute premium and will always lose, which defeats the
+        # point of having a watchlist at all.
+        wl = set(watchlist())
+        if wl:
+            for c in allc:
+                if c["ticker"] not in wl:
+                    continue
+                if seen[c["ticker"]] >= fc.MAX_PER_TICKER:
+                    continue
+                seen[c["ticker"]] += 1
+                picked.append(c); chosen.add(id(c))
+                c["_why"] = "watchlist"
+                if len(picked) >= fc.TOP_N_WATCHLIST:
+                    break
+            if picked:
+                print(f"  [{label}] {len(picked)} watchlist slots filled: "
+                      f"{', '.join(sorted({c['ticker'] for c in picked}))}",
+                      flush=True)
+
         for c in allc:
+            if id(c) in chosen:
+                continue
             if seen[c["ticker"]] >= fc.MAX_PER_TICKER:
                 continue
             seen[c["ticker"]] += 1
@@ -283,6 +317,7 @@ def main():
             "concentration": round(c["concentration"], 3),
             "verdict": tier.upper(),
             "band": c.get("_tier", "3-365d"),
+            "why": c.get("_why"),
             "partner": c.get("_partner"),
             "partner_hits": c.get("_partner_hits"),
             "ask_share": tape.get("ask_share"),
@@ -297,6 +332,13 @@ def main():
             "first_ts": tape.get("first_ts"), "last_ts": tape.get("last_ts"),
             "n_trades": tape.get("n_trades"),
             "n_classified": tape.get("n_classified"),
+            "max_print_prem": tape.get("max_print_prem"),
+            "max_print_size": tape.get("max_print_size"),
+            "max_print_ts": tape.get("max_print_ts"),
+            "max_print_share": tape.get("max_print_share"),
+            "top5_share": tape.get("top5_share"),
+            "n_blocks": tape.get("n_blocks"),
+            "block_prem": tape.get("block_prem"),
             "unusable": tape.get("unusable"),
             "classified_size": sum(p["size"]
                                    for p in (tape.get("prints") or [])),
@@ -306,6 +348,27 @@ def main():
                        for p in (tape.get("prints") or [])[:6]],
         }
         out.append(rec)
+
+        # block alert: one big print, independent of the directional verdict
+        mp = tape.get("max_print_prem") or 0
+        bkey = f"{c['contract']}|block"
+        if mp >= BLOCK_ALERT_PREMIUM and bkey not in sent:
+            when = ""
+            if tape.get("max_print_ts"):
+                when = (datetime.fromtimestamp(tape["max_print_ts"] / 1e9,
+                                               tz=timezone.utc)
+                        .astimezone(_ET).strftime("%H:%M:%S ET"))
+            alerts.append(
+                f"**BLOCK · {c['ticker']} {c['strike']:g}"
+                f"{c['type'][0].upper()} {c['expiry']:%m/%d}**\n"
+                f"${mp/1e6:.2f}M in ONE print — {tape['max_print_size']:,} "
+                f"contracts at {when}\n"
+                f"{tape.get('max_print_share', 0):.0%} of the contract's day "
+                f"premium · {tape.get('n_blocks', 0)} blocks over "
+                f"$250k total\n"
+                f"verdict {tier.upper()} · spot {c['spot']:,.2f} · "
+                f"{c['dte']}d to expiry")
+            new_keys.add(bkey)
 
         key = f"{c['contract']}|{tier}"
         if (tier in ALERT_TIERS
@@ -368,4 +431,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
