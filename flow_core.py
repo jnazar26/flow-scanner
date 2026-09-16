@@ -32,7 +32,14 @@ MAX_TICKERS      = 500     # Tier 1 scan breadth (1 API call each)
 # Tier 2 costs ~13 calls per contract, so each increment is real time. A wider
 # Tier 1 mostly improves WHICH contracts reach this stage rather than needing
 # more of them.
-TOP_N_DEEP       = 24      # contracts sent to Tier 2 tape analysis
+# Runs take ~71s since the fetches went concurrent, so there is room for more
+# depth than the old serial timing allowed.
+TOP_N_DEEP       = 40      # contracts sent to Tier 2 tape analysis
+# Slots held back for names on your watchlist. Without this they must outrank
+# AAPL and NVDA on raw premium to get analysed at all: SPCX 160C traded 13,001
+# contracts for $1.29M and scored 0.30 against a mega-cap cluster's 0.78, so it
+# never reached tape analysis despite being a name you follow.
+TOP_N_WATCHLIST  = 12
 MIN_PREMIUM      = 250_000 # ignore clusters below this
 MIN_VOL          = 100     # ignore contracts below this day volume
 # Two separate universes. 0-2 DTE is a different animal - overwhelmingly
@@ -42,7 +49,7 @@ MIN_VOL          = 100     # ignore contracts below this day volume
 # would win on premium every day.
 DTE_MIN, DTE_MAX = 3, 365
 ZERO_DTE_MIN, ZERO_DTE_MAX = 0, 2
-TOP_N_ZERO_DTE   = 10      # separate leaderboard for the 0-2 DTE tier
+TOP_N_ZERO_DTE   = 16      # separate leaderboard for the 0-2 DTE tier
 # Only liquid names list 0-2 DTE contracts at all, so that sweep does not need
 # the full universe. Scanning the top 150 keeps the two-pass run inside the
 # 5-minute cron.
@@ -58,6 +65,9 @@ SINGLE_PRINT_CONFIDENCE = 0.60 # ...and classified on a tight, fresh book
 TAPE_TOP_PRINTS  = 12      # largest prints classified per contract
 MIN_DIRECTIONAL_SHARE = 0.55  # premium at a touch required to claim a side
 MAX_QUOTE_AGE_MS = 5_000   # beyond this the quote is not a usable book
+# A single print at or above this is a block worth naming on its own, whatever
+# the contract's daily aggregate looks like.
+BLOCK_PREMIUM    = 250_000
 # Several distinct flows on one name are several events, not one. They get
 # grouped under a single card in the app but keep separate premium and
 # separate verdicts.
@@ -413,6 +423,16 @@ def classify_contract(occ, day):
     scored.sort(reverse=True)
     top = scored[:TAPE_TOP_PRINTS]
 
+    # SINGLE-PRINT PROFILE.
+    # The aggregate view cannot tell one whale from four hundred retail fills —
+    # SPCX 160C showed 13,001 contracts for $1.29M, which could have been
+    # either. These are already fetched, so measuring the largest individual
+    # print and its share of the day costs nothing.
+    day_prem = sum(x[0] for x in scored)
+    biggest = scored[0]
+    top5_prem = sum(x[0] for x in scored[:5])
+    block_prints = [x for x in scored if x[0] >= BLOCK_PREMIUM]
+
     ask_prem = bid_prem = mid_prem = 0.0
     conf_num = conf_den = 0.0
     stale = unusable = 0
@@ -479,6 +499,14 @@ def classify_contract(occ, day):
         "unusable": unusable,
         "n_directional": sum(1 for p in prints if p["side"] in ("BUY", "SELL")),
         "median_spread_pct": statistics.median(spreads) if spreads else None,
+        # single-print measures
+        "max_print_prem": biggest[0], "max_print_size": biggest[3],
+        "max_print_ts": biggest[1], "max_print_px": biggest[2],
+        "max_print_share": (biggest[0] / day_prem) if day_prem else 0.0,
+        "top5_share": (top5_prem / day_prem) if day_prem else 0.0,
+        "n_blocks": len(block_prints),
+        "block_prem": sum(x[0] for x in block_prints),
+        "tape_prem": day_prem,
         "n_trades": len(trades), "n_classified": len(spreads),
         "classified_prem": tot,
         "prints": sorted(prints, key=lambda x: -x["prem"]),
@@ -870,6 +898,5 @@ def render(c, tk, tape, iv_rank, prem_rank):
         if lv:
             L.append("    Levels: " + " · ".join(lv))
     return "\n".join(L)
-
 
 
