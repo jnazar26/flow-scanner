@@ -1,27 +1,34 @@
 name: Options flow scan
 
-# Every 10 minutes during US market hours, weekdays.
+# One long-running job that scans every 10 minutes internally, rather than a
+# cron that fires every 10 minutes.
 #
-# 13-20 UTC covers 9am-4pm ET during daylight saving; 14-21 covers it during
-# standard time, so both are listed and the overlap simply runs a few extra
-# scans in the pre/post-market hour. Cheap, and it means nothing has to be
-# changed twice a year.
+# The cron approach did not work. GitHub's scheduler is best-effort and sheds
+# high-frequency jobs under load: a */5 cron once went 16 hours without firing,
+# and the */10 that replaced it delivered 1-8 runs a day against the ~48 it
+# asked for, landing at arbitrary minutes (:33, :44, :12) hours after the
+# requested time. Every one of those runs SUCCEEDED — the scans were never
+# broken, they simply were not being started. Nothing in the cron expression
+# fixes that, because the expression is not what is being ignored.
 #
-# Deliberately 10 minutes rather than 5. GitHub's scheduler is best-effort and
-# drops high-frequency jobs first under load — a */5 cron went 16 hours
-# without firing. Runs take ~71s, so 10 minutes still leaves ample headroom
-# and is far more likely to actually execute.
+# So the schedule is now only a way to get a job STARTED. Once started, the
+# job loops on its own clock until the close, which needs the scheduler to
+# come through roughly once a day instead of forty-eight times.
 #
-# Unmetered because this repo is PUBLIC. Results are pushed to a separate
-# private repo so nothing about what is being watched is ever visible here.
+# 13-21 UTC covers 9am-4pm ET across both daylight saving and standard time;
+# the loop itself decides when to stop, so extra firings are harmless.
+#
+# Unmetered because this repo is PUBLIC. If it is ever made private, this
+# burns real runner minutes for hours a day — go back to a cron first.
 on:
   schedule:
-    - cron: "*/10 13-21 * * 1-5"
+    - cron: "7,37 13-21 * * 1-5"
   workflow_dispatch:
 
-# At this cadence a delayed run can collide with the next one. Cancel the
-# older scan rather than queue it - a stale reading is worth less than a
-# fresh one, and a backlog would compound.
+# Only one loop at a time, and the newest wins. This is what makes a dropped
+# schedule self-healing: whenever the scheduler does come through, that firing
+# cancels whatever loop is running and starts a fresh one, which scans
+# immediately. A cancel can only ever cost the current cycle.
 concurrency:
   group: flow-scan
   cancel-in-progress: true
@@ -29,7 +36,9 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Hosted jobs are killed at 6 hours regardless; the loop aims to exit
+    # cleanly before that on its own.
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +51,7 @@ jobs:
 
       # Pull the previous results out of the PRIVATE repo so the worker can
       # append to flow_contracts.csv and skip alerts it has already sent.
+      # Cloned once; the loop below keeps using this checkout.
       - name: Fetch prior results
         env:
           TOKEN: ${{ secrets.RESULTS_TOKEN }}
@@ -50,24 +60,65 @@ jobs:
           git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${REPO}.git" _results
           cp _results/flow_contracts.csv . 2>/dev/null || true
           cp _results/flow_alerted.json  . 2>/dev/null || true
-
-      - name: Scan
-        env:
-          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
-        run: python flow_worker.py
-
-      # Push results to the private repo. Nothing is committed here.
-      - name: Publish to private repo
-        env:
-          REPO: ${{ secrets.RESULTS_REPO }}
-        run: |
-          cp flow_latest.json flow_contracts.csv flow_alerted.json _results/ 2>/dev/null || true
           cd _results
           git config user.name  "flow-scanner"
           git config user.email "flow-scanner@users.noreply.github.com"
-          git add -A
-          git diff --staged --quiet && echo "no change" && exit 0
-          git commit -m "flow scan $(date -u +'%Y-%m-%d %H:%M')"
-          git pull --rebase --autostash
-          git push
+
+      # Scan, publish, sleep, repeat. Publishing happens inside the loop so
+      # each pass reaches the app as soon as it finishes.
+      - name: Scan every 10 minutes until the close
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+        run: |
+          set -u
+          started=$(date +%s)
+          fails=0
+
+          while :; do
+            if python flow_worker.py; then
+              fails=0
+            else
+              # A single bad pass is not worth ending the day over - the API
+              # rate-limits, and the next cycle usually goes through. A run of
+              # them means the key or the service is down, and looping for
+              # hours against that just buries the real error in the log.
+              fails=$((fails + 1))
+              echo "::warning::scan failed ($fails consecutive)"
+              if [ "$fails" -ge 5 ]; then
+                echo "::error::5 scans failed in a row - stopping"
+                exit 1
+              fi
+            fi
+
+            # Push results to the private repo. Nothing is committed here.
+            cp flow_latest.json flow_contracts.csv flow_alerted.json _results/ 2>/dev/null || true
+            (
+              cd _results
+              git add -A
+              if git diff --staged --quiet; then
+                echo "no change"
+              else
+                git commit -m "flow scan $(date -u +'%Y-%m-%d %H:%M')"
+                git pull --rebase --autostash
+                git push
+              fi
+            ) || echo "::warning::publish failed - next cycle will retry"
+
+            # %-H avoids a zero-padded hour, which would otherwise be read as
+            # octal. 930 and 1605 are then plain numbers to compare against.
+            now_et=$(TZ=America/New_York date +%-H%M)
+            if [ "$now_et" -ge 1605 ] || [ "$now_et" -lt 930 ]; then
+              echo "outside market hours (${now_et} ET) - done for the day"
+              break
+            fi
+
+            # Leave the job before the 6-hour ceiling kills it mid-push. The
+            # next scheduled firing picks the loop back up.
+            if [ $(( $(date +%s) - started )) -ge $(( 340 * 60 )) ]; then
+              echo "5h40m elapsed - exiting so a fresh run can take over"
+              break
+            fi
+
+            sleep 600
+          done
