@@ -11,24 +11,38 @@ name: Options flow scan
 # broken, they simply were not being started. Nothing in the cron expression
 # fixes that, because the expression is not what is being ignored.
 #
-# So the schedule is now only a way to get a job STARTED. Once started, the
-# job loops on its own clock until the close, which needs the scheduler to
-# come through roughly once a day instead of forty-eight times.
+# So a trigger is only a way to get a job STARTED. Once started, the job loops
+# on its own clock until the close, which means a trigger has to land roughly
+# once a day rather than forty-eight times. That made the schedule survivable
+# but not sufficient: it can still deliver nothing at all for a whole session,
+# which is why the primary trigger is now external (see below).
 #
 # 13-21 UTC covers 9am-4pm ET across both daylight saving and standard time;
 # the loop itself decides when to stop, so extra firings are harmless.
 #
 # Unmetered because this repo is PUBLIC. If it is ever made private, this
 # burns real runner minutes for hours a day — go back to a cron first.
+# repository_dispatch is the PRIMARY trigger. An external cron service calls
+# POST /repos/jnazar26/flow-scanner/dispatches with {"event_type":"scan"} every
+# 10 minutes, because GitHub's own scheduler cannot be relied on to start the
+# job at all: on 2026-09-24 it was asked to fire 18 times during the session
+# and delivered zero. The schedule below is kept only as a backstop for when
+# the external service is the thing that is down.
 on:
+  repository_dispatch:
+    types: [scan]
   schedule:
     - cron: "7,37 13-21 * * 1-5"
   workflow_dispatch:
 
 # Only one loop at a time, and the newest wins. This is what makes a dropped
-# schedule self-healing: whenever the scheduler does come through, that firing
-# cancels whatever loop is running and starts a fresh one, which scans
-# immediately. A cancel can only ever cost the current cycle.
+# trigger self-healing: whenever a trigger does come through, it cancels
+# whatever loop is running and starts a fresh one, which scans immediately. A
+# cancel can only ever cost the current cycle.
+#
+# CANCELLED RUNS ARE NORMAL HERE, not failures. With a 10-minute external
+# trigger, nearly every run ends cancelled by its successor. Look for runs
+# marked FAILED when something is actually wrong.
 concurrency:
   group: flow-scan
   cancel-in-progress: true
@@ -105,19 +119,37 @@ jobs:
               fi
             ) || echo "::warning::publish failed - next cycle will retry"
 
-            # %-H avoids a zero-padded hour, which would otherwise be read as
-            # octal. 930 and 1605 are then plain numbers to compare against.
-            now_et=$(TZ=America/New_York date +%-H%M)
-            if [ "$now_et" -ge 1605 ] || [ "$now_et" -lt 930 ]; then
-              echo "outside market hours (${now_et} ET) - done for the day"
-              break
-            fi
-
             # Leave the job before the 6-hour ceiling kills it mid-push. The
-            # next scheduled firing picks the loop back up.
+            # next trigger picks the loop back up. Checked FIRST so that no
+            # branch below can hold the job open past the budget.
             if [ $(( $(date +%s) - started )) -ge $(( 340 * 60 )) ]; then
               echo "5h40m elapsed - exiting so a fresh run can take over"
               break
+            fi
+
+            # %-H avoids a zero-padded hour, which would otherwise be read as
+            # octal. 930 and 1605 are then plain numbers to compare against.
+            now_et=$(TZ=America/New_York date +%-H%M)
+            dow=$(TZ=America/New_York date +%u)
+
+            # The external trigger fires on a clock, not a calendar, so a
+            # weekend call must not park a runner here for six hours.
+            if [ "$dow" -ge 6 ]; then
+              echo "weekend (day ${dow}) - one scan is enough"
+              break
+            fi
+            if [ "$now_et" -ge 1605 ]; then
+              echo "after the close (${now_et} ET) - done for the day"
+              break
+            fi
+            # Before the open, HOLD - do not exit. These two cases used to be
+            # one condition, so a run starting at 9:07 read "not 9:30 yet" as
+            # "done for the day" and quit after a single scan. The 13:07 UTC
+            # cron slot lands there in summer, and earlier in winter.
+            if [ "$now_et" -lt 930 ]; then
+              echo "before the open (${now_et} ET) - holding"
+              sleep 600
+              continue
             fi
 
             sleep 600
